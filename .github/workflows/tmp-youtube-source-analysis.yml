@@ -1,0 +1,250 @@
+name: tmp-youtube-source-analysis
+
+on:
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install tools
+        run: |
+          set -eux
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ffmpeg tesseract-ocr tesseract-ocr-kor fonts-dejavu-core
+          python -m pip install --upgrade pip
+          python -m pip install yt-dlp faster-whisper opencv-python-headless pillow numpy pytesseract
+
+      - name: Acquire transcript, captions, source video and audio
+        env:
+          VIDEO_ID: woSiT_kytXo
+          VIDEO_URL: https://www.youtube.com/watch?v=woSiT_kytXo
+        run: |
+          set +e
+          mkdir -p out/text out/media out/frames out/contact
+          echo "video_id=$VIDEO_ID" > out/text/acquisition_status.txt
+          date -u +'%Y-%m-%dT%H:%M:%SZ' >> out/text/acquisition_status.txt
+
+          echo '=== transcript API ko ===' >> out/text/acquisition_status.txt
+          curl -L --fail --retry 3 --connect-timeout 20 --max-time 120 \
+            "https://youtube-transcript.ai/transcript/${VIDEO_ID}.txt?lang=ko" \
+            -o out/text/transcript_api_ko.md 2>>out/text/acquisition_status.txt
+          echo "transcript_api_ko_exit=$?" >> out/text/acquisition_status.txt
+
+          echo '=== transcript API default ===' >> out/text/acquisition_status.txt
+          curl -L --fail --retry 3 --connect-timeout 20 --max-time 120 \
+            "https://youtube-transcript.ai/transcript/${VIDEO_ID}.txt" \
+            -o out/text/transcript_api_default.md 2>>out/text/acquisition_status.txt
+          echo "transcript_api_default_exit=$?" >> out/text/acquisition_status.txt
+
+          echo '=== yt-dlp metadata ===' >> out/text/acquisition_status.txt
+          yt-dlp --no-playlist --dump-single-json "$VIDEO_URL" \
+            > out/text/metadata.json 2>>out/text/acquisition_status.txt
+          echo "metadata_exit=$?" >> out/text/acquisition_status.txt
+
+          echo '=== yt-dlp subtitles ===' >> out/text/acquisition_status.txt
+          yt-dlp --no-playlist --skip-download --write-subs --write-auto-subs \
+            --sub-langs 'ko.*,ko,en.*,en' --sub-format vtt \
+            -o 'out/text/source.%(ext)s' "$VIDEO_URL" 2>>out/text/acquisition_status.txt
+          echo "subtitles_exit=$?" >> out/text/acquisition_status.txt
+
+          echo '=== yt-dlp video 720p ===' >> out/text/acquisition_status.txt
+          yt-dlp --no-playlist \
+            -f 'bv*[height<=720]+ba/b[height<=720]/best' \
+            --merge-output-format mp4 \
+            -o 'out/media/video.%(ext)s' "$VIDEO_URL" 2>>out/text/acquisition_status.txt
+          echo "video_exit=$?" >> out/text/acquisition_status.txt
+
+          VIDEO_FILE=$(find out/media -maxdepth 1 -type f \( -name 'video.mp4' -o -name 'video.webm' -o -name 'video.mkv' \) | head -1)
+          if [ -n "$VIDEO_FILE" ]; then
+            ffprobe -v error -show_format -show_streams -of json "$VIDEO_FILE" > out/text/ffprobe.json
+            ffmpeg -y -i "$VIDEO_FILE" -vn -ac 1 -ar 16000 -c:a pcm_s16le out/media/audio_16k.wav \
+              2>out/text/ffmpeg_audio.log
+          else
+            echo 'NO_VIDEO_FILE' >> out/text/acquisition_status.txt
+          fi
+          exit 0
+
+      - name: Independent ASR with faster-whisper
+        run: |
+          set +e
+          python - <<'PY'
+          from pathlib import Path
+          import json, sys, traceback
+          out = Path('out/text')
+          audio = Path('out/media/audio_16k.wav')
+          status = out/'asr_status.txt'
+          if not audio.exists():
+              status.write_text('audio missing\n', encoding='utf-8')
+              sys.exit(0)
+          try:
+              from faster_whisper import WhisperModel
+              model = WhisperModel('small', device='cpu', compute_type='int8')
+              segs, info = model.transcribe(str(audio), language='ko', beam_size=5, vad_filter=True,
+                                            word_timestamps=True, condition_on_previous_text=True)
+              rows=[]
+              md=[]
+              for s in segs:
+                  row={'start':s.start,'end':s.end,'text':s.text.strip(),
+                       'words':[{'start':w.start,'end':w.end,'word':w.word,'probability':w.probability} for w in (s.words or [])]}
+                  rows.append(row)
+                  m=int(s.start//60); sec=s.start-m*60
+                  md.append(f'[{m:02d}:{sec:05.2f}] {s.text.strip()}')
+              (out/'asr_faster_whisper_small.json').write_text(json.dumps({'language':info.language,'language_probability':info.language_probability,'duration':info.duration,'segments':rows}, ensure_ascii=False, indent=2), encoding='utf-8')
+              (out/'asr_faster_whisper_small.md').write_text('\n'.join(md), encoding='utf-8')
+              status.write_text(f'ok segments={len(rows)} duration={info.duration} lang={info.language} prob={info.language_probability}\n', encoding='utf-8')
+          except Exception:
+              status.write_text(traceback.format_exc(), encoding='utf-8')
+          PY
+          exit 0
+
+      - name: Process every video frame, select visual keyframes, OCR, and build contact sheets
+        run: |
+          set +e
+          python - <<'PY'
+          from pathlib import Path
+          import csv, json, math, os, traceback
+          import cv2, numpy as np
+          from PIL import Image, ImageDraw, ImageFont
+          import pytesseract
+
+          root=Path('out')
+          textdir=root/'text'; framedir=root/'frames'; contactdir=root/'contact'
+          candidates=list((root/'media').glob('video.*'))
+          status=textdir/'visual_status.txt'
+          if not candidates:
+              status.write_text('video missing\n', encoding='utf-8')
+              raise SystemExit
+          video=str(candidates[0])
+          cap=cv2.VideoCapture(video)
+          fps=float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+          total=int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+          width=int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0); height=int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+          duration=total/fps if fps else 0
+          small_w=160; small_h=max(90, int(small_w*height/max(width,1)))
+          prev=None; last_saved_t=-999.0; frame_idx=0
+          key=[]
+          mf=open(textdir/'frame_manifest.csv','w',newline='',encoding='utf-8')
+          wr=csv.writer(mf); wr.writerow(['frame_index','timestamp_sec','adjacent_mad','is_keyframe'])
+          try:
+              while True:
+                  ok, frame=cap.read()
+                  if not ok: break
+                  t=frame_idx/fps
+                  gray=cv2.cvtColor(cv2.resize(frame,(small_w,small_h)),cv2.COLOR_BGR2GRAY)
+                  mad=0.0 if prev is None else float(np.mean(cv2.absdiff(gray,prev)))
+                  # Every frame is measured. Persist a representative when visual change is substantial
+                  # or at least every 2 seconds to guarantee temporal coverage.
+                  save=(frame_idx==0) or (mad>=4.0) or (t-last_saved_t>=2.0)
+                  if save:
+                      fn=f'kf_{frame_idx:07d}_{int(t*1000):010d}.jpg'
+                      path=framedir/fn
+                      cv2.imwrite(str(path), frame, [int(cv2.IMWRITE_JPEG_QUALITY),82])
+                      key.append({'frame_index':frame_idx,'timestamp_sec':t,'adjacent_mad':mad,'file':fn})
+                      last_saved_t=t
+                  wr.writerow([frame_idx, f'{t:.6f}', f'{mad:.6f}', 1 if save else 0])
+                  prev=gray; frame_idx+=1
+          finally:
+              cap.release(); mf.close()
+
+          # OCR visual representatives. This is deliberately on unique/coverage keyframes,
+          # while the frame manifest above covers every decoded source frame.
+          ocr_rows=[]
+          for i,k in enumerate(key):
+              p=framedir/k['file']
+              img=cv2.imread(str(p))
+              try:
+                  # upscale mildly for slide/code text
+                  g=cv2.cvtColor(img,cv2.COLOR_BGR2GRAY)
+                  if g.shape[1] < 1400:
+                      scale=1400/g.shape[1]
+                      g=cv2.resize(g,None,fx=scale,fy=scale,interpolation=cv2.INTER_CUBIC)
+                  txt=pytesseract.image_to_string(g, lang='kor+eng', config='--psm 6', timeout=8).strip()
+              except Exception as e:
+                  txt=f'[OCR_ERROR] {e}'
+              row={**k,'ocr':txt}
+              ocr_rows.append(row)
+          with open(textdir/'keyframes_ocr.jsonl','w',encoding='utf-8') as f:
+              for r in ocr_rows: f.write(json.dumps(r,ensure_ascii=False)+'\n')
+          (textdir/'keyframes.json').write_text(json.dumps(key,ensure_ascii=False,indent=2),encoding='utf-8')
+
+          # one contact sheet per minute, up to 24 representative frames selected evenly
+          try:
+              font=ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',18)
+          except Exception:
+              font=ImageFont.load_default()
+          minutes=math.ceil(duration/60) if duration else 0
+          sheet_index=[]
+          for minute in range(minutes):
+              subset=[k for k in key if minute*60 <= k['timestamp_sec'] < (minute+1)*60]
+              if not subset: continue
+              if len(subset)>24:
+                  ids=np.linspace(0,len(subset)-1,24).round().astype(int)
+                  subset=[subset[j] for j in ids]
+              tw,th=320,180; labelh=24; cols=4; rows=math.ceil(len(subset)/cols)
+              canvas=Image.new('RGB',(cols*tw,rows*(th+labelh)),'white')
+              chosen=[]
+              for n,k in enumerate(subset):
+                  im=Image.open(framedir/k['file']).convert('RGB'); im.thumbnail((tw,th))
+                  tile=Image.new('RGB',(tw,th),'black'); tile.paste(im,((tw-im.width)//2,(th-im.height)//2))
+                  x=(n%cols)*tw; y=(n//cols)*(th+labelh)
+                  canvas.paste(tile,(x,y))
+                  d=ImageDraw.Draw(canvas)
+                  sec=k['timestamp_sec']; mm=int(sec//60); ss=sec-mm*60
+                  d.text((x+4,y+th+2),f'{mm:02d}:{ss:05.2f} f={k["frame_index"]} Δ={k["adjacent_mad"]:.1f}',fill='black',font=font)
+                  chosen.append(k['file'])
+              outp=contactdir/f'minute_{minute:02d}.jpg'; canvas.save(outp,quality=78,optimize=True)
+              sheet_index.append({'minute':minute,'file':outp.name,'frames':chosen})
+          (textdir/'contact_sheet_index.json').write_text(json.dumps(sheet_index,ensure_ascii=False,indent=2),encoding='utf-8')
+          status.write_text(f'ok fps={fps} decoded_frames={frame_idx} declared_frames={total} size={width}x{height} duration={duration:.3f} keyframes={len(key)} sheets={len(sheet_index)}\n',encoding='utf-8')
+          PY
+          exit 0
+
+      - name: Build compact evidence bundles
+        run: |
+          set +e
+          # Keep text, visual representatives/contact sheets, and source media separate.
+          tar -czf evidence-text.tar.gz -C out text
+          tar -czf evidence-visual.tar.gz -C out frames contact
+          tar -czf evidence-media.tar.gz -C out media
+          ls -lh evidence-*.tar.gz out/text/* > out/text/artifact_sizes.txt
+          exit 0
+
+      - name: Upload text evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: wosit-text-evidence
+          path: |
+            out/text
+          compression-level: 6
+          if-no-files-found: warn
+
+      - name: Upload visual evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: wosit-visual-evidence
+          path: |
+            out/frames
+            out/contact
+          compression-level: 6
+          if-no-files-found: warn
+
+      - name: Upload source media
+        uses: actions/upload-artifact@v4
+        with:
+          name: wosit-source-media
+          path: |
+            out/media
+          compression-level: 1
+          if-no-files-found: warn
