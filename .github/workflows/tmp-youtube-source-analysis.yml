@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 jobs:
-  browser-capture:
+  embed-capture:
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
@@ -20,172 +20,121 @@ jobs:
         run: |
           set -eux
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends ffmpeg xvfb
+          sudo apt-get install -y --no-install-recommends ffmpeg xvfb fonts-dejavu-core
           python -m pip install --upgrade pip
-          python -m pip install playwright requests
+          python -m pip install playwright requests pillow
           python -m playwright install --with-deps chromium
-      - name: Render YouTube and capture frames + media URLs
-        env:
-          VIDEO_ID: woSiT_kytXo
-          VIDEO_URL: https://www.youtube.com/watch?v=woSiT_kytXo
+      - name: Capture from YouTube embed/nocookie player
         run: |
-          mkdir -p out/browser_frames out/text out/media
+          mkdir -p out/frames out/text out/media out/contact
           xvfb-run -a python - <<'PY'
-          from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+          from playwright.sync_api import sync_playwright
           from pathlib import Path
-          import json, time, re, traceback, urllib.parse, os
-          VIDEO_URL=os.environ['VIDEO_URL']
-          out=Path('out'); fd=out/'browser_frames'; td=out/'text'; md=out/'media'
-          status=[]; media_urls=[]
-          def log(x): status.append(str(x)); print(x, flush=True)
+          from PIL import Image,ImageDraw,ImageFont
+          import json,time,re,traceback,urllib.parse,math,requests,subprocess
+          vid='woSiT_kytXo'; out=Path('out'); fd=out/'frames'; td=out/'text'; md=out/'media'; cd=out/'contact'
+          urls=[]; logs=[]
+          def log(s): logs.append(str(s)); print(s,flush=True)
+          embeds=[f'https://www.youtube-nocookie.com/embed/{vid}?autoplay=1&mute=1&controls=1&playsinline=1',f'https://www.youtube.com/embed/{vid}?autoplay=1&mute=1&controls=1&playsinline=1']
           with sync_playwright() as p:
-            browser=p.chromium.launch(headless=False, args=['--autoplay-policy=no-user-gesture-required','--disable-blink-features=AutomationControlled','--no-sandbox'])
-            ctx=browser.new_context(viewport={'width':1280,'height':720}, locale='ko-KR', user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36')
+            browser=p.chromium.launch(headless=False,args=['--autoplay-policy=no-user-gesture-required','--no-sandbox','--disable-blink-features=AutomationControlled'])
+            ctx=browser.new_context(viewport={'width':1280,'height':720},locale='ko-KR',user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36')
             page=ctx.new_page()
-            def on_request(req):
-              u=req.url
-              if 'googlevideo.com/videoplayback' in u:
-                media_urls.append(u)
-            page.on('request', on_request)
-            try:
-              resp=page.goto(VIDEO_URL, wait_until='domcontentloaded', timeout=90000)
-              log(f'goto_status={resp.status if resp else None} url={page.url} title={page.title()}')
-              page.screenshot(path=str(td/'page_initial.jpg'), full_page=False, quality=75, type='jpeg')
-              # dismiss likely consent dialogs
-              for label in ['Accept all','Reject all','모두 수락','모두 거부','동의','확인']:
-                try:
-                  loc=page.get_by_role('button', name=re.compile(label, re.I))
-                  if loc.count()>0:
-                    loc.first.click(timeout=1500); log(f'clicked={label}'); page.wait_for_timeout(1000); break
-                except Exception: pass
-              page.wait_for_timeout(5000)
-              # save html snippets for diagnostics
-              (td/'page.html').write_text(page.content(),encoding='utf-8')
-              # inspect player data
-              player=page.evaluate("() => ({hasVideo:!!document.querySelector('video'), title:document.title, yt: window.ytInitialPlayerResponse || null})")
-              if player.get('yt'):
-                (td/'ytInitialPlayerResponse.json').write_text(json.dumps(player['yt'],ensure_ascii=False,indent=2),encoding='utf-8')
-              log(f'has_video={player.get("hasVideo")}')
-              page.wait_for_selector('video', timeout=60000)
-              # mute and start to force media requests
-              page.evaluate("() => {const v=document.querySelector('video'); v.muted=true; v.volume=0; v.playbackRate=1; v.play().catch(()=>{});}")
-              page.wait_for_timeout(8000)
-              info=page.evaluate("() => {const v=document.querySelector('video'); return {duration:v.duration,currentTime:v.currentTime,readyState:v.readyState,videoWidth:v.videoWidth,videoHeight:v.videoHeight,paused:v.paused,error:v.error?{code:v.error.code,message:v.error.message}:null};}")
-              log('video_info='+json.dumps(info,ensure_ascii=False))
-              duration=info.get('duration') or 0
-              if duration and duration < 10000:
-                # capture a visual representative every 2 s across the entire source.
-                # This renders actual player frames; retries tolerate sparse buffering failures.
-                targets=[round(x*2.0,3) for x in range(int(duration//2)+1)]
-                captured=[]; failures=[]
-                video=page.locator('video')
+            page.on('request',lambda req: urls.append(req.url) if 'googlevideo.com/videoplayback' in req.url else None)
+            success=False
+            for eu in embeds:
+              try:
+                r=page.goto(eu,wait_until='domcontentloaded',timeout=90000); log(f'goto {eu} status={r.status if r else None} title={page.title()}')
+                page.wait_for_timeout(6000)
+                (td/f'embed_{len(logs)}.html').write_text(page.content(),encoding='utf-8')
+                page.screenshot(path=str(td/f'embed_{len(logs)}.jpg'),quality=75,type='jpeg')
+                n=page.locator('video').count(); log(f'video_count={n}')
+                if n<1: continue
+                info=page.evaluate("() => {const v=document.querySelector('video'); return {duration:v.duration,readyState:v.readyState,w:v.videoWidth,h:v.videoHeight,paused:v.paused,error:v.error?{code:v.error.code,message:v.error.message}:null,display:getComputedStyle(v).display,visibility:getComputedStyle(v).visibility};}")
+                log('before='+json.dumps(info,ensure_ascii=False))
+                page.evaluate("() => {const v=document.querySelector('video'); v.muted=true; v.volume=0; v.play().catch(()=>{});}")
+                page.wait_for_timeout(10000)
+                info=page.evaluate("() => {const v=document.querySelector('video'); return {duration:v.duration,currentTime:v.currentTime,readyState:v.readyState,w:v.videoWidth,h:v.videoHeight,paused:v.paused,error:v.error?{code:v.error.code,message:v.error.message}:null};}")
+                log('after='+json.dumps(info,ensure_ascii=False))
+                duration=info.get('duration') or 0
+                if not duration or duration>10000: continue
+                vloc=page.locator('video')
+                targets=[x*2.0 for x in range(int(duration//2)+1)]
+                cap=[]; fails=[]
                 for i,t in enumerate(targets):
                   try:
-                    page.evaluate("t => {const v=document.querySelector('video'); v.pause(); v.currentTime=t;}", t)
-                    # wait until seek position is close or at least frame ready
-                    page.wait_for_function("t => {const v=document.querySelector('video'); return v && v.readyState>=2 && Math.abs(v.currentTime-t)<1.5;}", t, timeout=8000)
-                    fn=f'frame_{i:05d}_{int(t*1000):010d}.jpg'
-                    video.screenshot(path=str(fd/fn), type='jpeg', quality=72)
-                    captured.append({'t':t,'file':fn})
-                    if i%50==0: log(f'captured {i}/{len(targets)} t={t}')
+                    page.evaluate("t => {const v=document.querySelector('video'); v.pause(); v.currentTime=t;}",t)
+                    page.wait_for_function("t => {const v=document.querySelector('video'); return v && v.readyState>=2 && Math.abs(v.currentTime-t)<1.25;}",t,timeout=5000)
+                    fn=f'f_{i:05d}_{int(t*1000):010d}.jpg'; vloc.screenshot(path=str(fd/fn),type='jpeg',quality=74); cap.append({'t':t,'file':fn})
+                    if i%100==0: log(f'capture {i}/{len(targets)} t={t}')
                   except Exception as e:
-                    failures.append({'t':t,'error':type(e).__name__+': '+str(e)[:200]})
-                    if len(failures)<20: log(f'capture_fail t={t}: {e}')
-                (td/'browser_frame_manifest.json').write_text(json.dumps({'duration':duration,'interval_sec':2,'captured':captured,'failures':failures},ensure_ascii=False,indent=2),encoding='utf-8')
-                log(f'capture_summary target={len(targets)} captured={len(captured)} failures={len(failures)}')
-              # collect resource timing URLs too
-              perf=page.evaluate("() => performance.getEntriesByType('resource').map(x=>x.name).filter(x=>x.includes('googlevideo.com/videoplayback'))")
-              media_urls.extend(perf or [])
-              cookies=ctx.cookies()
-              (td/'browser_cookies.json').write_text(json.dumps(cookies,ensure_ascii=False,indent=2),encoding='utf-8')
-            except Exception:
-              log('FATAL_BROWSER='+traceback.format_exc())
-            finally:
-              uniq=[]; seen=set()
-              for u in media_urls:
-                if u not in seen: seen.add(u); uniq.append(u)
-              (td/'googlevideo_urls.json').write_text(json.dumps(uniq,ensure_ascii=False,indent=2),encoding='utf-8')
-              log(f'googlevideo_url_count={len(uniq)}')
-              browser.close()
-          (td/'browser_status.txt').write_text('\n'.join(status),encoding='utf-8')
-          PY
-      - name: Try downloading captured googlevideo streams
-        run: |
-          set +e
-          python - <<'PY'
-          from pathlib import Path
-          import json,requests,urllib.parse,subprocess,os,traceback
-          td=Path('out/text'); md=Path('out/media'); st=[]
-          p=td/'googlevideo_urls.json'
-          urls=json.loads(p.read_text()) if p.exists() else []
-          def classify(u):
-            q=urllib.parse.parse_qs(urllib.parse.urlparse(u).query)
-            mime=urllib.parse.unquote((q.get('mime',[''])[0] or ''))
-            itag=(q.get('itag',[''])[0] or '')
-            return mime,itag
-          aud=[]; vid=[]
-          for u in urls:
-            mime,itag=classify(u)
+                    fails.append({'t':t,'e':type(e).__name__+':'+str(e)[:150]})
+                (td/'frame_manifest.json').write_text(json.dumps({'source':eu,'duration':duration,'interval':2,'captured':cap,'failures':fails},ensure_ascii=False,indent=2),encoding='utf-8')
+                log(f'CAPTURED={len(cap)} TARGET={len(targets)} FAIL={len(fails)}')
+                success=len(cap)>100
+                if success: break
+              except Exception:
+                log(traceback.format_exc())
+            # extra resource URLs
+            try: urls += page.evaluate("() => performance.getEntriesByType('resource').map(x=>x.name).filter(x=>x.includes('googlevideo.com/videoplayback'))") or []
+            except: pass
+            uniq=[]; seen=set()
+            for u in urls:
+              if u not in seen:seen.add(u);uniq.append(u)
+            (td/'googlevideo_urls.json').write_text(json.dumps(uniq,ensure_ascii=False,indent=2),encoding='utf-8'); log(f'googlevideo_urls={len(uniq)} success={success}')
+            browser.close()
+          (td/'status.txt').write_text('\n'.join(logs),encoding='utf-8')
+          # Build per-minute contact sheets from 2-second captures.
+          imgs=sorted(fd.glob('f_*.jpg'))
+          try: font=ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',15)
+          except: font=ImageFont.load_default()
+          ci=[]
+          for gi in range(math.ceil(len(imgs)/30)):
+            ss=imgs[gi*30:(gi+1)*30]
+            if not ss: continue
+            tw,th,lh,cols=256,144,20,5; rows=math.ceil(len(ss)/cols); can=Image.new('RGB',(tw*cols,(th+lh)*rows),'white')
+            for n,pth in enumerate(ss):
+              im=Image.open(pth).convert('RGB'); im.thumbnail((tw,th)); tile=Image.new('RGB',(tw,th),'black'); tile.paste(im,((tw-im.width)//2,(th-im.height)//2)); x=(n%cols)*tw; y=(n//cols)*(th+lh); can.paste(tile,(x,y)); mt=re.search(r'_(\d{10})\.jpg$',pth.name); sec=(int(mt.group(1))/1000 if mt else 0); mm=int(sec//60); s=sec-mm*60; ImageDraw.Draw(can).text((x+2,y+th+1),f'{mm:02d}:{s:04.1f}',fill='black',font=font)
+            op=cd/f'min_{gi:02d}.jpg'; can.save(op,quality=72,optimize=True); ci.append(op.name)
+          (td/'contact_index.json').write_text(json.dumps(ci,indent=2),encoding='utf-8')
+          # Try direct media requests obtained from the embedded player.
+          def meta(u):
+            q=urllib.parse.parse_qs(urllib.parse.urlparse(u).query); return urllib.parse.unquote(q.get('mime',[''])[0]),q.get('itag',[''])[0]
+          aud=[]; vds=[]
+          for u in json.loads((td/'googlevideo_urls.json').read_text()):
+            mime,itag=meta(u)
             if 'audio/' in mime: aud.append((u,mime,itag))
-            elif 'video/' in mime: vid.append((u,mime,itag))
-          st.append(f'urls={len(urls)} video_urls={len(vid)} audio_urls={len(aud)}')
-          headers={'User-Agent':'Mozilla/5.0','Referer':'https://www.youtube.com/'}
-          def dl(item,path):
-            u,mime,itag=item
-            # captured requests may include Range query constraints; ask server for the full stream with HTTP ranges
-            with requests.get(u,headers=headers,stream=True,timeout=(20,180)) as r:
-              st.append(f'GET itag={itag} mime={mime} status={r.status_code} len={r.headers.get("content-length")} range={r.headers.get("content-range")}')
+            if 'video/' in mime: vds.append((u,mime,itag))
+          ms=[f'video={len(vds)} audio={len(aud)}']
+          def dl(x,path):
+            u,mime,itag=x
+            with requests.get(u,headers={'User-Agent':'Mozilla/5.0','Referer':'https://www.youtube.com/'},stream=True,timeout=(20,240)) as r:
+              ms.append(f'GET {itag} {mime} status={r.status_code} len={r.headers.get("content-length")} range={r.headers.get("content-range")}')
               r.raise_for_status()
               with open(path,'wb') as f:
                 for ch in r.iter_content(1024*1024):
                   if ch:f.write(ch)
-            st.append(f'downloaded {path} bytes={Path(path).stat().st_size}')
           try:
-            if vid: dl(vid[0],md/'captured_video.bin')
-            if aud: dl(aud[0],md/'captured_audio.bin')
-            if (md/'captured_video.bin').exists() and (md/'captured_audio.bin').exists():
-              subprocess.run(['ffmpeg','-y','-i',str(md/'captured_video.bin'),'-i',str(md/'captured_audio.bin'),'-c','copy',str(md/'source_muxed.mp4')],stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=600)
-              st.append(f'mux_exists={(md/"source_muxed.mp4").exists()} mux_bytes={(md/"source_muxed.mp4").stat().st_size if (md/"source_muxed.mp4").exists() else 0}')
-          except Exception:
-            st.append(traceback.format_exc())
-          (td/'media_download_status.txt').write_text('\n'.join(st),encoding='utf-8')
+            if vds: dl(vds[0],md/'v.bin')
+            if aud: dl(aud[0],md/'a.bin')
+            if (md/'v.bin').exists() and (md/'a.bin').exists(): subprocess.run(['ffmpeg','-y','-i',str(md/'v.bin'),'-i',str(md/'a.bin'),'-c','copy',str(md/'source.mp4')],timeout=600,capture_output=True); ms.append(f'source={ (md/"source.mp4").exists() }')
+          except Exception: ms.append(traceback.format_exc())
+          (td/'media_status.txt').write_text('\n'.join(ms),encoding='utf-8')
           PY
-          # create small diagnostic contact sheets from browser screenshots
-          python - <<'PY'
-          from pathlib import Path
-          from PIL import Image,ImageDraw,ImageFont
-          import math,json,re
-          fd=Path('out/browser_frames'); td=Path('out/text')
-          imgs=sorted(fd.glob('frame_*.jpg'))
-          if not imgs: raise SystemExit
-          try: font=ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',16)
-          except: font=ImageFont.load_default()
-          # group every 30 source frames = one minute because interval 2s
-          index=[]
-          for gi in range(math.ceil(len(imgs)/30)):
-            subset=imgs[gi*30:(gi+1)*30]
-            if not subset:continue
-            tw,th,lh,cols=256,144,22,5; rows=math.ceil(len(subset)/cols)
-            can=Image.new('RGB',(cols*tw,rows*(th+lh)),'white')
-            for n,p in enumerate(subset):
-              im=Image.open(p).convert('RGB'); im.thumbnail((tw,th)); tile=Image.new('RGB',(tw,th),'black'); tile.paste(im,((tw-im.width)//2,(th-im.height)//2)); x=n%cols*tw; y=n//cols*(th+lh); can.paste(tile,(x,y)); d=ImageDraw.Draw(can); m=re.search(r'_(\d{10})\.jpg$',p.name); ms=int(m.group(1)) if m else 0; sec=ms/1000; mm=int(sec//60); ss=sec-mm*60; d.text((x+3,y+th+2),f'{mm:02d}:{ss:04.1f}',fill='black',font=font)
-            op=td/f'contact_minute_{gi:02d}.jpg'; can.save(op,quality=70,optimize=True); index.append(op.name)
-          (td/'contact_index.json').write_text(json.dumps(index,indent=2),encoding='utf-8')
-          PY
-          exit 0
-      - name: Upload browser evidence
+      - name: Upload visual evidence
         uses: actions/upload-artifact@v4
         with:
-          name: wosit-browser-evidence
+          name: wosit-embed-visual
           path: |
             out/text
-            out/browser_frames
+            out/contact
+            out/frames
           compression-level: 6
           if-no-files-found: warn
-      - name: Upload captured media
+      - name: Upload media if captured
         uses: actions/upload-artifact@v4
         with:
-          name: wosit-browser-media
+          name: wosit-embed-media
           path: out/media
           compression-level: 1
           if-no-files-found: warn
