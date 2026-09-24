@@ -8,133 +8,119 @@ permissions:
   contents: read
 
 jobs:
-  embed-capture:
+  cobalt-capture:
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - name: Install browser tools
+      - name: Start yt session generator and cobalt
         run: |
-          set -eux
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends ffmpeg xvfb fonts-dejavu-core
-          python -m pip install --upgrade pip
-          python -m pip install playwright requests pillow
-          python -m playwright install --with-deps chromium
-      - name: Capture from YouTube embed/nocookie player
+          set +e
+          mkdir -p out/text out/media
+          docker pull ghcr.io/imputnet/yt-session-generator:webserver > out/text/pull_session.log 2>&1
+          docker pull ghcr.io/imputnet/cobalt:11 > out/text/pull_cobalt.log 2>&1
+          docker run -d --name yt-session --privileged -p 8080:8080 ghcr.io/imputnet/yt-session-generator:webserver > out/text/session_container_id.txt 2>&1
+          # Wait for token endpoint. The generator can need Chromium startup time.
+          ok=0
+          for i in $(seq 1 90); do
+            if curl -fsS --max-time 5 http://127.0.0.1:8080/token > out/text/session_token.json 2>/dev/null; then ok=1; echo "session_ready_at=$i" > out/text/session_status.txt; break; fi
+            sleep 2
+          done
+          echo "session_ready=$ok" >> out/text/session_status.txt
+          docker logs yt-session > out/text/session_generator.log 2>&1 || true
+
+          docker run -d --name cobalt --add-host host.docker.internal:host-gateway -p 9000:9000 \
+            -e API_URL=http://127.0.0.1:9000/ \
+            -e YOUTUBE_SESSION_SERVER=http://host.docker.internal:8080/token \
+            -e YOUTUBE_SESSION_INNERTUBE_CLIENT=WEB \
+            -e ENABLE_DEPRECATED_YOUTUBE_HLS=always \
+            ghcr.io/imputnet/cobalt:11 > out/text/cobalt_container_id.txt 2>&1
+          for i in $(seq 1 60); do
+            if curl -fsS --max-time 5 http://127.0.0.1:9000/ > out/text/cobalt_root.txt 2>/dev/null; then echo "cobalt_ready_at=$i" > out/text/cobalt_status.txt; break; fi
+            sleep 2
+          done
+          docker logs cobalt > out/text/cobalt_start.log 2>&1 || true
+
+      - name: Ask cobalt for target video
+        env:
+          VIDEO_URL: https://www.youtube.com/watch?v=woSiT_kytXo
         run: |
-          mkdir -p out/frames out/text out/media out/contact
-          xvfb-run -a python - <<'PY'
-          from playwright.sync_api import sync_playwright
+          set +e
+          mkdir -p out/text out/media
+          # Try modern request variants, first ordinary auto mode then HLS-assisted.
+          python - <<'PY'
+          import requests,json,os,time,traceback
           from pathlib import Path
-          from PIL import Image,ImageDraw,ImageFont
-          import json,time,re,traceback,urllib.parse,math,requests,subprocess
-          vid='woSiT_kytXo'; out=Path('out'); fd=out/'frames'; td=out/'text'; md=out/'media'; cd=out/'contact'
-          urls=[]; logs=[]
-          def log(s): logs.append(str(s)); print(s,flush=True)
-          embeds=[f'https://www.youtube-nocookie.com/embed/{vid}?autoplay=1&mute=1&controls=1&playsinline=1',f'https://www.youtube.com/embed/{vid}?autoplay=1&mute=1&controls=1&playsinline=1']
-          with sync_playwright() as p:
-            browser=p.chromium.launch(headless=False,args=['--autoplay-policy=no-user-gesture-required','--no-sandbox','--disable-blink-features=AutomationControlled'])
-            ctx=browser.new_context(viewport={'width':1280,'height':720},locale='ko-KR',user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36')
-            page=ctx.new_page()
-            page.on('request',lambda req: urls.append(req.url) if 'googlevideo.com/videoplayback' in req.url else None)
-            success=False
-            for eu in embeds:
-              try:
-                r=page.goto(eu,wait_until='domcontentloaded',timeout=90000); log(f'goto {eu} status={r.status if r else None} title={page.title()}')
-                page.wait_for_timeout(6000)
-                (td/f'embed_{len(logs)}.html').write_text(page.content(),encoding='utf-8')
-                page.screenshot(path=str(td/f'embed_{len(logs)}.jpg'),quality=75,type='jpeg')
-                n=page.locator('video').count(); log(f'video_count={n}')
-                if n<1: continue
-                info=page.evaluate("() => {const v=document.querySelector('video'); return {duration:v.duration,readyState:v.readyState,w:v.videoWidth,h:v.videoHeight,paused:v.paused,error:v.error?{code:v.error.code,message:v.error.message}:null,display:getComputedStyle(v).display,visibility:getComputedStyle(v).visibility};}")
-                log('before='+json.dumps(info,ensure_ascii=False))
-                page.evaluate("() => {const v=document.querySelector('video'); v.muted=true; v.volume=0; v.play().catch(()=>{});}")
-                page.wait_for_timeout(10000)
-                info=page.evaluate("() => {const v=document.querySelector('video'); return {duration:v.duration,currentTime:v.currentTime,readyState:v.readyState,w:v.videoWidth,h:v.videoHeight,paused:v.paused,error:v.error?{code:v.error.code,message:v.error.message}:null};}")
-                log('after='+json.dumps(info,ensure_ascii=False))
-                duration=info.get('duration') or 0
-                if not duration or duration>10000: continue
-                vloc=page.locator('video')
-                targets=[x*2.0 for x in range(int(duration//2)+1)]
-                cap=[]; fails=[]
-                for i,t in enumerate(targets):
-                  try:
-                    page.evaluate("t => {const v=document.querySelector('video'); v.pause(); v.currentTime=t;}",t)
-                    page.wait_for_function("t => {const v=document.querySelector('video'); return v && v.readyState>=2 && Math.abs(v.currentTime-t)<1.25;}",t,timeout=5000)
-                    fn=f'f_{i:05d}_{int(t*1000):010d}.jpg'; vloc.screenshot(path=str(fd/fn),type='jpeg',quality=74); cap.append({'t':t,'file':fn})
-                    if i%100==0: log(f'capture {i}/{len(targets)} t={t}')
-                  except Exception as e:
-                    fails.append({'t':t,'e':type(e).__name__+':'+str(e)[:150]})
-                (td/'frame_manifest.json').write_text(json.dumps({'source':eu,'duration':duration,'interval':2,'captured':cap,'failures':fails},ensure_ascii=False,indent=2),encoding='utf-8')
-                log(f'CAPTURED={len(cap)} TARGET={len(targets)} FAIL={len(fails)}')
-                success=len(cap)>100
-                if success: break
-              except Exception:
-                log(traceback.format_exc())
-            # extra resource URLs
-            try: urls += page.evaluate("() => performance.getEntriesByType('resource').map(x=>x.name).filter(x=>x.includes('googlevideo.com/videoplayback'))") or []
-            except: pass
-            uniq=[]; seen=set()
-            for u in urls:
-              if u not in seen:seen.add(u);uniq.append(u)
-            (td/'googlevideo_urls.json').write_text(json.dumps(uniq,ensure_ascii=False,indent=2),encoding='utf-8'); log(f'googlevideo_urls={len(uniq)} success={success}')
-            browser.close()
-          (td/'status.txt').write_text('\n'.join(logs),encoding='utf-8')
-          # Build per-minute contact sheets from 2-second captures.
-          imgs=sorted(fd.glob('f_*.jpg'))
-          try: font=ImageFont.truetype('/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',15)
-          except: font=ImageFont.load_default()
-          ci=[]
-          for gi in range(math.ceil(len(imgs)/30)):
-            ss=imgs[gi*30:(gi+1)*30]
-            if not ss: continue
-            tw,th,lh,cols=256,144,20,5; rows=math.ceil(len(ss)/cols); can=Image.new('RGB',(tw*cols,(th+lh)*rows),'white')
-            for n,pth in enumerate(ss):
-              im=Image.open(pth).convert('RGB'); im.thumbnail((tw,th)); tile=Image.new('RGB',(tw,th),'black'); tile.paste(im,((tw-im.width)//2,(th-im.height)//2)); x=(n%cols)*tw; y=(n//cols)*(th+lh); can.paste(tile,(x,y)); mt=re.search(r'_(\d{10})\.jpg$',pth.name); sec=(int(mt.group(1))/1000 if mt else 0); mm=int(sec//60); s=sec-mm*60; ImageDraw.Draw(can).text((x+2,y+th+1),f'{mm:02d}:{s:04.1f}',fill='black',font=font)
-            op=cd/f'min_{gi:02d}.jpg'; can.save(op,quality=72,optimize=True); ci.append(op.name)
-          (td/'contact_index.json').write_text(json.dumps(ci,indent=2),encoding='utf-8')
-          # Try direct media requests obtained from the embedded player.
-          def meta(u):
-            q=urllib.parse.parse_qs(urllib.parse.urlparse(u).query); return urllib.parse.unquote(q.get('mime',[''])[0]),q.get('itag',[''])[0]
-          aud=[]; vds=[]
-          for u in json.loads((td/'googlevideo_urls.json').read_text()):
-            mime,itag=meta(u)
-            if 'audio/' in mime: aud.append((u,mime,itag))
-            if 'video/' in mime: vds.append((u,mime,itag))
-          ms=[f'video={len(vds)} audio={len(aud)}']
-          def dl(x,path):
-            u,mime,itag=x
-            with requests.get(u,headers={'User-Agent':'Mozilla/5.0','Referer':'https://www.youtube.com/'},stream=True,timeout=(20,240)) as r:
-              ms.append(f'GET {itag} {mime} status={r.status_code} len={r.headers.get("content-length")} range={r.headers.get("content-range")}')
-              r.raise_for_status()
-              with open(path,'wb') as f:
-                for ch in r.iter_content(1024*1024):
-                  if ch:f.write(ch)
-          try:
-            if vds: dl(vds[0],md/'v.bin')
-            if aud: dl(aud[0],md/'a.bin')
-            if (md/'v.bin').exists() and (md/'a.bin').exists(): subprocess.run(['ffmpeg','-y','-i',str(md/'v.bin'),'-i',str(md/'a.bin'),'-c','copy',str(md/'source.mp4')],timeout=600,capture_output=True); ms.append(f'source={ (md/"source.mp4").exists() }')
-          except Exception: ms.append(traceback.format_exc())
-          (td/'media_status.txt').write_text('\n'.join(ms),encoding='utf-8')
+          out=Path('out'); td=out/'text'; md=out/'media'; url=os.environ['VIDEO_URL']
+          attempts=[
+            {'url':url,'videoQuality':'480','downloadMode':'auto','filenameStyle':'basic'},
+            {'url':url,'videoQuality':'720','downloadMode':'auto','filenameStyle':'basic'},
+            {'url':url,'videoQuality':'480','downloadMode':'auto','filenameStyle':'basic','youtubeHLS':True},
+            {'url':url,'downloadMode':'audio','audioFormat':'best','filenameStyle':'basic'},
+          ]
+          log=[]
+          sess=requests.Session(); sess.headers.update({'Accept':'application/json','Content-Type':'application/json','User-Agent':'Mozilla/5.0'})
+          for i,payload in enumerate(attempts):
+            try:
+              r=sess.post('http://127.0.0.1:9000/',json=payload,timeout=90)
+              log.append(f'ATTEMPT {i} HTTP {r.status_code} {r.text[:2000]}')
+              (td/f'cobalt_response_{i}.txt').write_text(r.text,encoding='utf-8')
+              if r.status_code!=200: continue
+              try:data=r.json()
+              except:continue
+              u=data.get('url')
+              if not u: continue
+              # Tunnel URL may use API_URL host; normalize localhost if necessary.
+              u=u.replace('http://127.0.0.1:9000','http://127.0.0.1:9000').replace('http://localhost:9000','http://127.0.0.1:9000')
+              dest=md/(f'cobalt_{i}.bin')
+              with sess.get(u,stream=True,allow_redirects=True,timeout=(20,600)) as rr:
+                log.append(f'DOWNLOAD {i} HTTP {rr.status_code} content-type={rr.headers.get("content-type")} len={rr.headers.get("content-length")} final={rr.url}')
+                rr.raise_for_status()
+                with open(dest,'wb') as f:
+                  for ch in rr.iter_content(1024*1024):
+                    if ch:f.write(ch)
+              log.append(f'DOWNLOADED {dest} bytes={dest.stat().st_size}')
+            except Exception:
+              log.append(f'ATTEMPT {i} ERROR\n{traceback.format_exc()}')
+          (td/'cobalt_attempts.log').write_text('\n\n'.join(log),encoding='utf-8')
           PY
-      - name: Upload visual evidence
+          docker logs cobalt > out/text/cobalt_final.log 2>&1 || true
+          docker logs yt-session > out/text/session_final.log 2>&1 || true
+          ls -lh out/media > out/text/media_ls.txt || true
+          exit 0
+
+      - name: Identify playable outputs and derive video/audio
+        run: |
+          set +e
+          python - <<'PY'
+          from pathlib import Path
+          import subprocess,json,os
+          md=Path('out/media'); td=Path('out/text'); rows=[]
+          candidates=sorted(md.glob('cobalt_*.bin'),key=lambda p:p.stat().st_size,reverse=True)
+          selected=None
+          for p in candidates:
+            pr=subprocess.run(['ffprobe','-v','error','-show_format','-show_streams','-of','json',str(p)],capture_output=True,text=True)
+            rows.append({'file':p.name,'bytes':p.stat().st_size,'ffprobe_rc':pr.returncode,'ffprobe':pr.stdout[:20000],'stderr':pr.stderr[:2000]})
+            if pr.returncode==0 and selected is None:selected=p
+          (td/'probe_results.json').write_text(json.dumps(rows,ensure_ascii=False,indent=2),encoding='utf-8')
+          if selected:
+            # Remux by stream copy if possible; otherwise transcode just enough for analysis.
+            r=subprocess.run(['ffmpeg','-y','-i',str(selected),'-c','copy',str(md/'source.mp4')],capture_output=True,text=True)
+            if r.returncode!=0:
+              subprocess.run(['ffmpeg','-y','-i',str(selected),'-c:v','libx264','-preset','veryfast','-crf','26','-c:a','aac','-b:a','96k',str(md/'source.mp4')],capture_output=True,text=True)
+            src=md/'source.mp4'
+            if src.exists():
+              subprocess.run(['ffprobe','-v','error','-show_format','-show_streams','-of','json',str(src)],stdout=open(td/'source_ffprobe.json','w'),stderr=subprocess.DEVNULL)
+              subprocess.run(['ffmpeg','-y','-i',str(src),'-vn','-ac','1','-ar','16000','-c:a','pcm_s16le',str(md/'audio_16k.wav')],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+          PY
+          exit 0
+
+      - name: Upload evidence
         uses: actions/upload-artifact@v4
         with:
-          name: wosit-embed-visual
+          name: wosit-cobalt-evidence
           path: |
             out/text
-            out/contact
-            out/frames
-          compression-level: 6
-          if-no-files-found: warn
-      - name: Upload media if captured
-        uses: actions/upload-artifact@v4
-        with:
-          name: wosit-embed-media
-          path: out/media
+            out/media
           compression-level: 1
           if-no-files-found: warn
