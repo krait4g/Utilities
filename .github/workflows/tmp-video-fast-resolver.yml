@@ -1,0 +1,102 @@
+name: tmp-video-fast-resolver
+on:
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg jq curl
+      - name: Resolve and download one best media pair
+        shell: bash
+        run: |
+          set +e
+          OUT="$GITHUB_WORKSPACE/resolved"
+          mkdir -p "$OUT/api" "$OUT/logs" "$OUT/storyboards"
+          VID='woSiT_kytXo'
+          bases=(
+            'https://pipedapi.kavin.rocks'
+            'https://pipedapi.leptons.xyz'
+            'https://pipedapi.nosebs.ru'
+            'https://pipedapi.syncpundit.io'
+            'https://api-piped.mha.fi'
+            'https://piped-api.garudalinux.org'
+          )
+          OK=''
+          for base in "${bases[@]}"; do
+            key=$(echo "$base" | sed 's#https://##; s#[^A-Za-z0-9]#_#g')
+            code=$(curl -sS -L --connect-timeout 10 --max-time 45 -w '%{http_code}' "$base/streams/$VID" -o "$OUT/api/$key.json")
+            echo "$base $code" >> "$OUT/logs/piped_status.txt"
+            if [ "$code" = 200 ] && jq -e '.videoStreams and .audioStreams' "$OUT/api/$key.json" >/dev/null 2>&1; then OK="$OUT/api/$key.json"; break; fi
+          done
+          echo "$OK" > "$OUT/selected_piped_file.txt"
+
+          # Always query current trusted Invidious instances for metadata/storyboard templates.
+          invs=(
+            'https://inv.nadeko.net'
+            'https://invidious.nerdvpn.de'
+            'https://yt.chocolatemoo53.com'
+            'https://invidious.tiekoetter.com'
+          )
+          for base in "${invs[@]}"; do
+            key=$(echo "$base" | sed 's#https://##; s#[^A-Za-z0-9]#_#g')
+            curl -sS -L --connect-timeout 10 --max-time 45 "$base/api/v1/videos/$VID?local=true" -o "$OUT/api/inv_$key.json"
+          done
+
+          if [ -n "$OK" ]; then
+            python - <<'PY'
+          import json,os,re
+          p=open(os.environ['OUT']+'/selected_piped_file.txt').read().strip()
+          j=json.load(open(p,encoding='utf-8'))
+          vs=[x for x in j.get('videoStreams',[]) if isinstance(x,dict) and x.get('url')]
+          aus=[x for x in j.get('audioStreams',[]) if isinstance(x,dict) and x.get('url')]
+          # Prefer <=1080p, non-HLS, normal video streams. Then highest resolution/bitrate.
+          good=[x for x in vs if (x.get('height') or 0)<=1080 and not x.get('hls')]
+          if not good: good=vs
+          good=sorted(good,key=lambda x:((x.get('height') or 0),(x.get('bitrate') or 0)),reverse=True)
+          aus=sorted(aus,key=lambda x:(x.get('bitrate') or 0),reverse=True)
+          v=good[0] if good else None; a=aus[0] if aus else None
+          report={'title':j.get('title'),'duration':j.get('duration'),'video':v,'audio':a,'previewFrames':j.get('previewFrames')}
+          json.dump(report,open(os.environ['OUT']+'/selected_streams.json','w',encoding='utf-8'),ensure_ascii=False,indent=2)
+          if v: open(os.environ['OUT']+'/video_url.txt','w').write(v['url'])
+          if a: open(os.environ['OUT']+'/audio_url.txt','w').write(a['url'])
+          PY
+            VURL=$(cat "$OUT/video_url.txt" 2>/dev/null)
+            AURL=$(cat "$OUT/audio_url.txt" 2>/dev/null)
+            if [ -n "$VURL" ]; then curl -fL --retry 2 --retry-all-errors --connect-timeout 15 --max-time 700 "$VURL" -o "$OUT/video_only.bin" 2>"$OUT/logs/video_download.log" & VP=$!; else VP=''; fi
+            if [ -n "$AURL" ]; then curl -fL --retry 2 --retry-all-errors --connect-timeout 15 --max-time 700 "$AURL" -o "$OUT/audio_only.bin" 2>"$OUT/logs/audio_download.log" & AP=$!; else AP=''; fi
+            [ -n "$VP" ] && wait "$VP"
+            [ -n "$AP" ] && wait "$AP"
+            if [ -s "$OUT/video_only.bin" ] && [ -s "$OUT/audio_only.bin" ]; then
+              ffmpeg -y -i "$OUT/video_only.bin" -i "$OUT/audio_only.bin" -c copy "$OUT/video.mp4" >"$OUT/logs/merge.out" 2>"$OUT/logs/merge.err"
+            elif [ -s "$OUT/video_only.bin" ]; then
+              cp "$OUT/video_only.bin" "$OUT/video.mp4"
+            fi
+          fi
+
+          # If media is playable, create a manageable 10-second visual sample + scene frames + full audio.
+          if [ -s "$OUT/video.mp4" ] && ffprobe -v error "$OUT/video.mp4" >/dev/null 2>&1; then
+            ffprobe -v quiet -print_format json -show_format -show_streams "$OUT/video.mp4" > "$OUT/ffprobe.json"
+            ffmpeg -y -i "$OUT/video.mp4" -vn -ac 1 -ar 16000 -c:a libopus -b:a 24k "$OUT/audio_16k.opus" >"$OUT/logs/audio_extract.out" 2>"$OUT/logs/audio_extract.err"
+            mkdir -p "$OUT/frames_10s" "$OUT/scenes"
+            ffmpeg -y -i "$OUT/video.mp4" -vf 'fps=1/10,scale=1280:-2' -q:v 3 "$OUT/frames_10s/%05d.jpg" >"$OUT/logs/frames.out" 2>"$OUT/logs/frames.err"
+            ffmpeg -y -i "$OUT/video.mp4" -vf "select='gt(scene,0.10)',scale=1280:-2" -vsync vfr -q:v 3 "$OUT/scenes/%05d.jpg" >"$OUT/logs/scenes.out" 2>"$OUT/logs/scenes.err"
+          fi
+          find "$OUT" -type f -printf '%p\t%s bytes\n' | sort > "$OUT/FILES.txt"
+          cat "$OUT/FILES.txt"
+        env:
+          OUT: ${{ github.workspace }}/resolved
+      - name: Upload resolver output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fast-resolved-video-woSiT-kytXo
+          path: resolved/
+          retention-days: 1
+          compression-level: 0
