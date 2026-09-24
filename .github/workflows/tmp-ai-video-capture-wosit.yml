@@ -1,0 +1,290 @@
+name: temporary-ai-video-capture
+
+on:
+  push:
+    branches:
+      - tmp-ai-video-capture-wosit
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install capture dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg jq tesseract-ocr tesseract-ocr-kor python3-pip
+          python -m pip install --upgrade --pre yt-dlp opencv-python-headless pillow
+          node --version
+          ffmpeg -version | head -1
+          yt-dlp --version
+
+      - name: Acquire transcript and source video
+        shell: bash
+        run: |
+          set +e
+          mkdir -p out/logs out/text out/frames_5s out/scenes out/contact out/ocr
+          VIDEO_ID="woSiT_kytXo"
+          URL="https://www.youtube.com/watch?v=${VIDEO_ID}"
+
+          curl -L --retry 5 --retry-all-errors -A "Mozilla/5.0" \
+            "https://youtube-transcript.ai/transcript/${VIDEO_ID}.txt?lang=ko" \
+            -o out/text/transcript_ko_timestamped.md \
+            >out/logs/transcript_curl_stdout.log 2>out/logs/transcript_curl_stderr.log
+
+          acquire_ytdlp () {
+            local label="$1"
+            local args="$2"
+            echo "===== TRY ${label} =====" | tee -a out/logs/acquire.log
+            timeout 420 yt-dlp \
+              --remote-components ejs:github \
+              --js-runtimes node \
+              --no-playlist \
+              --force-ipv4 \
+              --retries 3 \
+              --fragment-retries 3 \
+              --socket-timeout 20 \
+              -f "bv*[height<=720]+ba/b[height<=720]/b" \
+              --merge-output-format mp4 \
+              -o "source.%(ext)s" \
+              ${args} "${URL}" \
+              >>out/logs/acquire.log 2>&1
+            ls -lah source.* >>out/logs/acquire.log 2>&1
+            test -f source.mp4 && test -s source.mp4
+          }
+
+          acquire_ytdlp default "" || true
+          if [ ! -s source.mp4 ]; then acquire_ytdlp web_embedded '--extractor-args "youtube:player_client=web_embedded"' || true; fi
+          if [ ! -s source.mp4 ]; then acquire_ytdlp mweb '--extractor-args "youtube:player_client=mweb"' || true; fi
+          if [ ! -s source.mp4 ]; then acquire_ytdlp tv '--extractor-args "youtube:player_client=tv"' || true; fi
+          if [ ! -s source.mp4 ]; then acquire_ytdlp android_vr '--extractor-args "youtube:player_client=android_vr"' || true; fi
+
+          python - <<'PY'
+import json, os, subprocess, urllib.request, urllib.error, ssl, time
+VID='woSiT_kytXo'
+log=open('out/logs/alt_streams.log','a',encoding='utf-8')
+def get_json(url, timeout=15):
+    req=urllib.request.Request(url, headers={'User-Agent':'Mozilla/5.0','Accept':'application/json'})
+    with urllib.request.urlopen(req, timeout=timeout, context=ssl.create_default_context()) as r:
+        return json.loads(r.read().decode('utf-8','replace'))
+
+def download(url, path):
+    log.write(f'DOWNLOAD {url[:180]} -> {path}\n'); log.flush()
+    subprocess.run(['curl','-L','--retry','3','--retry-all-errors','--max-time','420','-A','Mozilla/5.0',url,'-o',path],
+                   stdout=log, stderr=log, check=False)
+    return os.path.exists(path) and os.path.getsize(path)>100000
+
+if os.path.exists('source.mp4') and os.path.getsize('source.mp4')>100000:
+    log.write('yt-dlp already succeeded\n'); log.close(); raise SystemExit
+
+# Piped instance discovery + streams API
+instance_lists=[
+  'https://piped-instances.kavin.rocks/',
+  'https://pipedapi.kavin.rocks/instances',
+]
+apis=[]
+for u in instance_lists:
+    try:
+        data=get_json(u)
+        if isinstance(data,list):
+            for x in data:
+                if isinstance(x,dict):
+                    a=x.get('api_url') or x.get('apiUrl') or x.get('api')
+                    if a: apis.append(a.rstrip('/'))
+    except Exception as e: log.write(f'instance list fail {u}: {e}\n')
+apis += [
+ 'https://pipedapi.kavin.rocks',
+ 'https://pipedapi.adminforge.de',
+ 'https://pipedapi.reallyaweso.me',
+ 'https://pipedapi-libre.kavin.rocks',
+]
+seen=set()
+for api in apis:
+    if api in seen: continue
+    seen.add(api)
+    try:
+        log.write(f'PIPED TRY {api}\n'); log.flush()
+        d=get_json(f'{api}/streams/{VID}',12)
+        vs=[x for x in d.get('videoStreams',[]) if x.get('url')]
+        aus=[x for x in d.get('audioStreams',[]) if x.get('url')]
+        # Prefer <=720 video, sort by quality numeric if possible
+        def qnum(x):
+            q=''.join(c for c in str(x.get('quality','')) if c.isdigit())
+            return int(q or 0)
+        eligible=[x for x in vs if qnum(x)<=720] or vs
+        eligible=sorted(eligible,key=qnum,reverse=True)
+        aus=sorted(aus,key=lambda x:int(x.get('bitrate') or 0),reverse=True)
+        if not eligible or not aus: continue
+        if download(eligible[0]['url'],'video_only.bin') and download(aus[0]['url'],'audio_only.bin'):
+            p=subprocess.run(['ffmpeg','-y','-i','video_only.bin','-i','audio_only.bin','-c','copy','source.mp4'],
+                             stdout=log,stderr=log)
+            if os.path.exists('source.mp4') and os.path.getsize('source.mp4')>100000:
+                log.write(f'PIPED SUCCESS {api}\n'); log.flush(); break
+    except Exception as e:
+        log.write(f'PIPED FAIL {api}: {type(e).__name__}: {e}\n'); log.flush()
+
+# Invidious public instances if still missing
+if not (os.path.exists('source.mp4') and os.path.getsize('source.mp4')>100000):
+    try:
+        inst=get_json('https://api.invidious.io/instances.json?sort_by=health')
+        hosts=[]
+        for row in inst:
+            if isinstance(row,list) and len(row)>=2 and isinstance(row[1],dict):
+                if row[1].get('api') and row[1].get('type','https')=='https':
+                    uri=row[1].get('uri') or ('https://'+row[0])
+                    hosts.append(uri.rstrip('/'))
+        for host in hosts[:30]:
+            try:
+                log.write(f'INVIDIOUS TRY {host}\n'); log.flush()
+                d=get_json(f'{host}/api/v1/videos/{VID}',12)
+                fmts=d.get('adaptiveFormats',[])
+                v=[x for x in fmts if str(x.get('type','')).startswith('video/') and x.get('url')]
+                a=[x for x in fmts if str(x.get('type','')).startswith('audio/') and x.get('url')]
+                v=sorted(v,key=lambda x:int(x.get('height') or 0),reverse=True)
+                v=[x for x in v if int(x.get('height') or 0)<=720] or v
+                a=sorted(a,key=lambda x:int(x.get('bitrate') or 0),reverse=True)
+                if v and a and download(v[0]['url'],'video_only.bin') and download(a[0]['url'],'audio_only.bin'):
+                    subprocess.run(['ffmpeg','-y','-i','video_only.bin','-i','audio_only.bin','-c','copy','source.mp4'],
+                                   stdout=log,stderr=log)
+                    if os.path.exists('source.mp4') and os.path.getsize('source.mp4')>100000:
+                        log.write(f'INVIDIOUS SUCCESS {host}\n'); log.flush(); break
+            except Exception as e:
+                log.write(f'INVIDIOUS FAIL {host}: {type(e).__name__}: {e}\n'); log.flush()
+    except Exception as e:
+        log.write(f'Invidious discovery fail: {e}\n')
+log.close()
+PY
+
+          if [ -s source.mp4 ]; then
+            ffprobe -v error -show_format -show_streams -of json source.mp4 > out/video_probe.json
+            echo "VIDEO_ACQUIRED=1" > out/status.env
+          else
+            echo "VIDEO_ACQUIRED=0" > out/status.env
+          fi
+          cat out/status.env
+
+      - name: Analyze every decoded frame and extract visual evidence
+        shell: bash
+        run: |
+          set -euxo pipefail
+          source out/status.env
+          if [ "$VIDEO_ACQUIRED" != "1" ]; then
+            echo "No source video acquired" > out/logs/frame_analysis_skipped.txt
+            exit 0
+          fi
+
+          # Five-second timeline frames and scene-change frames.
+          ffmpeg -hide_banner -loglevel error -i source.mp4 -vf "fps=1/5,scale=960:-2" -q:v 4 out/frames_5s/f_%06d.jpg
+          ffmpeg -hide_banner -loglevel error -i source.mp4 -vf "select='gt(scene,0.12)',scale=960:-2" -vsync vfr -q:v 3 out/scenes/s_%06d.jpg
+
+          # Analyze every decoded frame: time, image-change score, brightness, edge density.
+          python - <<'PY'
+import cv2, csv, os, heapq, math
+cap=cv2.VideoCapture('source.mp4')
+fps=cap.get(cv2.CAP_PROP_FPS) or 30.0
+n=int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+rows=[]
+prev=None
+top=[]
+idx=0
+os.makedirs('out/top_changes',exist_ok=True)
+while True:
+    ok,frame=cap.read()
+    if not ok: break
+    small=cv2.resize(frame,(160,90))
+    gray=cv2.cvtColor(small,cv2.COLOR_BGR2GRAY)
+    bright=float(gray.mean())
+    edges=cv2.Canny(gray,80,160)
+    edge=float((edges>0).mean())
+    delta=0.0 if prev is None else float(cv2.absdiff(gray,prev).mean())
+    t=idx/fps
+    rows.append((idx,t,delta,bright,edge))
+    if len(top)<250:
+        heapq.heappush(top,(delta,idx,t,frame.copy()))
+    elif delta>top[0][0]:
+        heapq.heapreplace(top,(delta,idx,t,frame.copy()))
+    prev=gray
+    idx+=1
+cap.release()
+with open('out/all_frame_metrics.csv','w',newline='',encoding='utf-8') as f:
+    w=csv.writer(f); w.writerow(['frame_index','time_sec','mean_abs_delta','brightness','edge_density']); w.writerows(rows)
+with open('out/frame_summary.txt','w',encoding='utf-8') as f:
+    f.write(f'fps={fps}\nframes_decoded={idx}\nduration_by_frames={idx/fps if fps else 0}\n')
+for rank,item in enumerate(sorted(top,reverse=True),1):
+    d,i,t,fr=item
+    cv2.imwrite(f'out/top_changes/{rank:03d}_t{t:09.3f}_d{d:06.2f}.jpg',fr,[int(cv2.IMWRITE_JPEG_QUALITY),85])
+PY
+
+          # OCR on 5-second frames and scene frames.
+          python - <<'PY'
+import glob, os, subprocess
+imgs=glob.glob('out/frames_5s/*.jpg')+glob.glob('out/scenes/*.jpg')
+os.makedirs('out/ocr',exist_ok=True)
+for i,p in enumerate(imgs):
+    base=os.path.splitext(os.path.basename(p))[0]
+    out=os.path.join('out/ocr',base)
+    subprocess.run(['tesseract',p,out,'-l','kor+eng','--psm','6'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+PY
+
+          # Contact sheets, 25 frames per sheet, from the 5-second timeline.
+          python - <<'PY'
+from PIL import Image,ImageOps,ImageDraw
+import glob,os,math
+files=sorted(glob.glob('out/frames_5s/*.jpg'))
+os.makedirs('out/contact',exist_ok=True)
+per=25; cols=5; cellw=320; cellh=200
+for s in range(0,len(files),per):
+    batch=files[s:s+per]
+    canvas=Image.new('RGB',(cols*cellw,5*cellh),'white')
+    for j,p in enumerate(batch):
+        im=Image.open(p).convert('RGB'); im.thumbnail((cellw,cellh-20))
+        tile=Image.new('RGB',(cellw,cellh),'white')
+        tile.paste(im,((cellw-im.width)//2,0))
+        d=ImageDraw.Draw(tile); d.text((4,cellh-18),os.path.basename(p),fill='black')
+        canvas.paste(tile,((j%cols)*cellw,(j//cols)*cellh))
+    canvas.save(f'out/contact/contact_{s//per:03d}.jpg',quality=85)
+PY
+
+          # Audio waveform source (not raw full transcript output).
+          ffmpeg -hide_banner -loglevel error -i source.mp4 -vn -ac 1 -ar 16000 -c:a flac out/audio_16k_mono.flac
+
+          # Do not upload the copyrighted source video itself.
+          rm -f source.mp4 video_only.bin audio_only.bin
+
+      - name: Build manifest
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+import os,glob,json,hashlib
+def sha(p):
+    h=hashlib.sha256()
+    with open(p,'rb') as f:
+        for b in iter(lambda:f.read(1024*1024),b''): h.update(b)
+    return h.hexdigest()
+files=[]
+for root,dirs,names in os.walk('out'):
+    for n in names:
+        p=os.path.join(root,n)
+        files.append({'path':p,'bytes':os.path.getsize(p),'sha256':sha(p)})
+with open('out/manifest.json','w',encoding='utf-8') as f:
+    json.dump({'video_id':'woSiT_kytXo','files':files},f,ensure_ascii=False,indent=2)
+PY
+          du -sh out
+          find out -maxdepth 2 -type f | sort | sed -n '1,120p'
+
+      - name: Upload capture artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: woSiT-kytXo-capture
+          path: out
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 1
