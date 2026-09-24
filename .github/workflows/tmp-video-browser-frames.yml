@@ -1,0 +1,101 @@
+name: tmp-video-browser-frames
+on:
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  sample:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Playwright
+        run: |
+          mkdir -p /tmp/pw && cd /tmp/pw
+          npm init -y >/dev/null 2>&1
+          npm install playwright@latest >/dev/null 2>&1
+          npx playwright install --with-deps chromium
+      - name: Seek through the actual browser player and capture frames
+        shell: bash
+        run: |
+          set +e
+          OUT="$GITHUB_WORKSPACE/browser_frames"
+          mkdir -p "$OUT/frames" "$OUT/pages"
+          cat >/tmp/pw/capture.js <<'NODE'
+          const { chromium } = require('playwright');
+          const fs = require('fs');
+          const out=process.env.OUT;
+          const id='woSiT_kytXo';
+          const candidates=[
+            `https://www.youtube-nocookie.com/embed/${id}?autoplay=1&mute=1&controls=1&playsinline=1`,
+            `https://www.youtube.com/embed/${id}?autoplay=1&mute=1&controls=1&playsinline=1`,
+            `https://www.youtube.com/watch?v=${id}`
+          ];
+          (async()=>{
+            const browser=await chromium.launch({headless:true,args:['--autoplay-policy=no-user-gesture-required','--no-sandbox','--disable-dev-shm-usage']});
+            const ctx=await browser.newContext({viewport:{width:1600,height:1000},locale:'ko-KR',userAgent:'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36'});
+            let chosen=null, report={attempts:[], mediaRequests:[]};
+            for (const url of candidates) {
+              const page=await ctx.newPage();
+              page.on('response', async r=>{
+                const u=r.url();
+                if(u.includes('googlevideo.com')||u.includes('/videoplayback')){
+                  let h={}; try{h=await r.allHeaders();}catch(e){}
+                  report.mediaRequests.push({url:u,status:r.status(),contentType:h['content-type']||'',contentLength:h['content-length']||''});
+                }
+              });
+              let attempt={url};
+              try{
+                await page.goto(url,{waitUntil:'domcontentloaded',timeout:90000});
+                await page.waitForTimeout(8000);
+                attempt.title=await page.title();
+                attempt.body=(await page.locator('body').innerText().catch(()=>'' )).slice(0,10000);
+                const state=await page.evaluate(()=>{const v=document.querySelector('video');return v?{duration:v.duration,currentTime:v.currentTime,readyState:v.readyState,paused:v.paused,videoWidth:v.videoWidth,videoHeight:v.videoHeight,currentSrc:v.currentSrc}:null;});
+                attempt.state=state;
+                await page.screenshot({path:`${out}/pages/attempt_${report.attempts.length}.jpg`,quality:78,fullPage:false});
+                if(state && Number.isFinite(state.duration) && state.duration>3000 && state.videoWidth>0){chosen=page; report.attempts.push(attempt); break;}
+              }catch(e){attempt.error=String(e)}
+              report.attempts.push(attempt);
+              await page.close();
+            }
+            if(chosen){
+              try{await chosen.locator('video').evaluate(v=>{v.muted=true;return v.play();});}catch(e){}
+              const duration=await chosen.locator('video').evaluate(v=>v.duration);
+              report.duration=duration;
+              // 15-second coverage across the full ~52:38 video. 211 actual frames from the player.
+              for(let t=0;t<duration;t+=15){
+                try{
+                  const st=await chosen.locator('video').evaluate(async(v,t)=>{
+                    const target=Math.min(t,Math.max(0,v.duration-0.25));
+                    v.currentTime=target;
+                    await new Promise(resolve=>{let done=false;const f=()=>{if(!done){done=true;resolve();}};v.addEventListener('seeked',f,{once:true});setTimeout(f,3500);});
+                    await new Promise(r=>setTimeout(r,350));
+                    return {target,currentTime:v.currentTime,readyState:v.readyState,videoWidth:v.videoWidth,videoHeight:v.videoHeight};
+                  },t);
+                  const name=`t_${String(Math.floor(t)).padStart(4,'0')}.jpg`;
+                  await chosen.locator('video').screenshot({path:`${out}/frames/${name}`,quality:80});
+                  fs.appendFileSync(`${out}/frame_manifest.jsonl`,JSON.stringify({file:name,...st})+'\n');
+                }catch(e){fs.appendFileSync(`${out}/frame_errors.log`,`${t}\t${String(e)}\n`);}
+              }
+            }
+            report.mediaRequests=[...new Map(report.mediaRequests.map(x=>[x.url,x])).values()];
+            fs.writeFileSync(`${out}/browser_report.json`,JSON.stringify(report,null,2));
+            if(chosen) await chosen.close();
+            await browser.close();
+          })().catch(e=>{fs.writeFileSync(`${out}/fatal.txt`,String(e)); process.exitCode=0;});
+          NODE
+          OUT="$OUT" node /tmp/pw/capture.js
+          find "$OUT" -type f -printf '%p\t%s bytes\n' | sort > "$OUT/FILES.txt"
+          cat "$OUT/FILES.txt"
+        env:
+          OUT: ${{ github.workspace }}/browser_frames
+      - name: Upload actual browser-player frames
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-frames-woSiT-kytXo
+          path: browser_frames/
+          retention-days: 1
+          compression-level: 0
