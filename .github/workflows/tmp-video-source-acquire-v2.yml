@@ -1,0 +1,222 @@
+name: tmp-video-source-acquire-v2
+
+on:
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  acquire-v2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install media and browser tooling
+        shell: bash
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg jq curl
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade --pre 'yt-dlp[default]' yt-dlp-ejs bgutil-ytdlp-pot-provider
+          node --version
+          yt-dlp --version
+          mkdir -p /tmp/pw
+          cd /tmp/pw
+          npm init -y >/dev/null 2>&1
+          npm install playwright@latest >/dev/null 2>&1
+          npx playwright install --with-deps chromium
+
+      - name: Acquire with current yt-dlp clients, PO-token provider, Microlink, and browser playback
+        shell: bash
+        run: |
+          set +e
+          ROOT="$GITHUB_WORKSPACE"
+          OUT="$ROOT/source_v2"
+          mkdir -p "$OUT/logs" "$OUT/probes" "$OUT/screens"
+          VID='woSiT_kytXo'
+          URL="https://www.youtube.com/watch?v=$VID"
+          EMBED="https://www.youtube-nocookie.com/embed/$VID?autoplay=1&mute=1&controls=1"
+
+          echo "$URL" > "$OUT/target.txt"
+
+          # A. Microlink: query each media type separately and keep response bodies even on errors.
+          for KIND in video audio meta; do
+            for VARIANT in watch short embed; do
+              case "$VARIANT" in
+                watch) TARGET="$URL" ;;
+                short) TARGET="https://youtu.be/$VID" ;;
+                embed) TARGET="https://www.youtube.com/embed/$VID" ;;
+              esac
+              curl -sS -L -G --connect-timeout 15 --max-time 240 \
+                -D "$OUT/probes/microlink_${KIND}_${VARIANT}.headers" \
+                'https://api.microlink.io/' \
+                --data-urlencode "url=$TARGET" \
+                --data "$KIND=true" \
+                -o "$OUT/probes/microlink_${KIND}_${VARIANT}.json"
+            done
+          done
+
+          # B. Probe current YouTube player clients before any token-provider setup.
+          for CLIENTS in 'web_embedded,tv,android_vr' 'web_safari' 'mweb' 'tv' 'android_vr'; do
+            SAFE=$(echo "$CLIENTS" | tr ',' '_')
+            yt-dlp --js-runtimes node --no-playlist --extractor-args "youtube:player_client=$CLIENTS" -F "$URL" \
+              > "$OUT/probes/formats_${SAFE}.out" 2> "$OUT/probes/formats_${SAFE}.err"
+          done
+
+          # C. Start bgutil POT provider server (current yt-dlp recommended approach).
+          git clone --depth 1 --branch 1.3.1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git /tmp/bgutil \
+            >"$OUT/logs/bgutil_git.out" 2>"$OUT/logs/bgutil_git.err"
+          if [ -d /tmp/bgutil/server ]; then
+            cd /tmp/bgutil/server
+            npm ci >"$OUT/logs/bgutil_npm.out" 2>"$OUT/logs/bgutil_npm.err"
+            npx tsc >>"$OUT/logs/bgutil_npm.out" 2>>"$OUT/logs/bgutil_npm.err"
+            nohup node build/main.js >"$OUT/logs/bgutil_server.out" 2>"$OUT/logs/bgutil_server.err" &
+            echo $! > "$OUT/logs/bgutil_server.pid"
+            sleep 4
+          fi
+          cd "$ROOT"
+
+          # D. Native media attempts with the provider running.
+          yt-dlp -v --js-runtimes node --no-playlist --extractor-args 'youtube:player_client=mweb' \
+            -f 'bv*[height<=1080]+ba/b[height<=1080]' --merge-output-format mp4 \
+            -o "$OUT/video_bgutil.%(ext)s" "$URL" \
+            >"$OUT/logs/ytdlp_bgutil.out" 2>"$OUT/logs/ytdlp_bgutil.err"
+
+          yt-dlp -v --js-runtimes node --no-playlist --extractor-args 'youtube:player_client=web_embedded,tv,android_vr' \
+            -f 'bv*[height<=1080]+ba/b[height<=1080]' --merge-output-format mp4 \
+            -o "$OUT/video_clients.%(ext)s" "$URL" \
+            >"$OUT/logs/ytdlp_clients.out" 2>"$OUT/logs/ytdlp_clients.err"
+
+          # E. Browser playback probe. Capture all googlevideo response URLs, player state, and representative real frames.
+          cat > /tmp/pw/probe.js <<'NODE'
+          const { chromium } = require('playwright');
+          const fs = require('fs');
+          (async() => {
+            const out = process.env.OUTDIR;
+            const url = process.env.EMBEDURL;
+            const browser = await chromium.launch({headless:true, args:['--autoplay-policy=no-user-gesture-required','--no-sandbox']});
+            const context = await browser.newContext({ viewport:{width:1600,height:1000}, userAgent:'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/140 Safari/537.36' });
+            const page = await context.newPage();
+            const media = [];
+            page.on('response', async r => {
+              const u = r.url();
+              if (u.includes('googlevideo.com') || u.includes('/videoplayback')) {
+                let ct=''; try { ct=(await r.allHeaders())['content-type']||''; } catch(e){}
+                media.push({url:u,status:r.status(),contentType:ct});
+              }
+            });
+            const report={url, events:[], errors:[]};
+            try {
+              await page.goto(url,{waitUntil:'domcontentloaded',timeout:90000});
+              await page.waitForTimeout(10000);
+              report.title=await page.title();
+              report.html=(await page.content()).slice(0,500000);
+              await page.screenshot({path:`${out}/screens/page_initial.jpg`,quality:80,fullPage:false});
+              let st=await page.evaluate(() => { const v=document.querySelector('video'); return v ? {duration:v.duration,currentTime:v.currentTime,readyState:v.readyState,networkState:v.networkState,paused:v.paused,src:v.currentSrc||v.src,videoWidth:v.videoWidth,videoHeight:v.videoHeight} : null; });
+              report.events.push({stage:'initial',state:st});
+              try { await page.locator('button.ytp-large-play-button').click({timeout:5000}); } catch(e) {}
+              try { await page.locator('video').evaluate(v=>v.play()); } catch(e) {}
+              await page.waitForTimeout(6000);
+              const times=[0,5,30,60,120,300,600,900,1200,1800,2400,3000,3120];
+              for (const t of times) {
+                try {
+                  const result=await page.locator('video').evaluate(async (v,t) => {
+                    const target=Math.min(t, Math.max(0,(isFinite(v.duration)?v.duration:3200)-1));
+                    v.currentTime=target;
+                    await new Promise(resolve=>{ let done=false; const f=()=>{if(!done){done=true;resolve();}}; v.addEventListener('seeked',f,{once:true}); setTimeout(f,6000); });
+                    try { await v.play(); } catch(e) {}
+                    await new Promise(r=>setTimeout(r,900));
+                    return {target,currentTime:v.currentTime,duration:v.duration,readyState:v.readyState,paused:v.paused,videoWidth:v.videoWidth,videoHeight:v.videoHeight};
+                  },t);
+                  report.events.push({stage:`seek_${t}`,state:result});
+                  const loc=page.locator('video');
+                  if (await loc.count()) await loc.screenshot({path:`${out}/screens/t_${String(t).padStart(4,'0')}.jpg`,quality:82});
+                } catch(e) { report.errors.push({stage:`seek_${t}`,error:String(e)}); }
+              }
+            } catch(e) { report.errors.push({stage:'main',error:String(e)}); }
+            fs.writeFileSync(`${out}/browser_report.json`,JSON.stringify(report,null,2));
+            const uniq=[...new Map(media.map(x=>[x.url,x])).values()];
+            fs.writeFileSync(`${out}/googlevideo_urls.json`,JSON.stringify(uniq,null,2));
+            await browser.close();
+          })().catch(e=>{ console.error(e); process.exitCode=0; });
+          NODE
+          OUTDIR="$OUT" EMBEDURL="$EMBED" node /tmp/pw/probe.js >"$OUT/logs/playwright.out" 2>"$OUT/logs/playwright.err"
+
+          # F. Download any browser-resolved media URLs. Try several candidates by MIME class.
+          python - <<'PY'
+          import json, os, subprocess
+          out=os.environ['OUT']
+          p=os.path.join(out,'googlevideo_urls.json')
+          if not os.path.exists(p): raise SystemExit(0)
+          try: rows=json.load(open(p,encoding='utf-8'))
+          except Exception: raise SystemExit(0)
+          vids=[]; auds=[]; unknown=[]
+          for r in rows:
+            ct=(r.get('contentType') or '').lower(); u=r.get('url')
+            if not u: continue
+            if 'video/' in ct: vids.append(u)
+            elif 'audio/' in ct: auds.append(u)
+            else: unknown.append(u)
+          for kind, arr in [('video',vids),('audio',auds),('unknown',unknown)]:
+            for i,u in enumerate(arr[:6]):
+              dest=os.path.join(out,f'browser_{kind}_{i}.bin')
+              log=os.path.join(out,'logs',f'browser_download_{kind}_{i}.log')
+              with open(log,'wb') as fp:
+                subprocess.run(['curl','-fL','--retry','2','--connect-timeout','15','--max-time','900',u,'-o',dest],stdout=fp,stderr=subprocess.STDOUT)
+              if os.path.exists(dest) and os.path.getsize(dest)<1024:
+                os.remove(dest)
+          PY
+
+          # G. Extract any successful Microlink resolved URLs and download.
+          python - <<'PY'
+          import glob,json,os,subprocess
+          out=os.environ['OUT']
+          found=[]
+          for p in glob.glob(out+'/probes/microlink_*.json'):
+            try: j=json.load(open(p,encoding='utf-8'))
+            except: continue
+            d=j.get('data') or {}
+            for key in ('video','audio'):
+              v=d.get(key)
+              if isinstance(v,dict) and v.get('url'): found.append((key,v['url'],p))
+          open(out+'/microlink_resolved.txt','w').write('\n'.join(f'{k}\t{u}\t{p}' for k,u,p in found))
+          for i,(k,u,p) in enumerate(found[:8]):
+            dest=f'{out}/microlink_{k}_{i}.bin'
+            subprocess.run(['curl','-fL','--retry','3','--connect-timeout','15','--max-time','1200',u,'-o',dest])
+          PY
+
+          # H. Select a real playable file, probe it, and derive compressed audio + dense frames when possible.
+          CAND=''
+          for f in "$OUT"/video_bgutil.* "$OUT"/video_clients.* "$OUT"/browser_video_*.bin "$OUT"/microlink_video_*.bin; do
+            [ -f "$f" ] || continue
+            if ffprobe -v error "$f" >/dev/null 2>&1; then CAND="$f"; break; fi
+          done
+          if [ -n "$CAND" ]; then
+            cp "$CAND" "$OUT/video.mp4"
+            ffprobe -v quiet -print_format json -show_format -show_streams "$OUT/video.mp4" > "$OUT/ffprobe.json"
+            ffmpeg -y -i "$OUT/video.mp4" -vn -ac 1 -ar 16000 -c:a libopus -b:a 24k "$OUT/audio_16k.opus" >"$OUT/logs/ffmpeg_audio.out" 2>"$OUT/logs/ffmpeg_audio.err"
+            mkdir -p "$OUT/frames_5s" "$OUT/scenes"
+            ffmpeg -y -i "$OUT/video.mp4" -vf 'fps=1/5,scale=1280:-2' -q:v 3 "$OUT/frames_5s/%06d.jpg" >"$OUT/logs/frames5.out" 2>"$OUT/logs/frames5.err"
+            ffmpeg -y -i "$OUT/video.mp4" -vf "select='gt(scene,0.12)',scale=1280:-2,showinfo" -vsync vfr -q:v 3 "$OUT/scenes/%06d.jpg" >"$OUT/logs/scenes.out" 2>"$OUT/logs/scenes.err"
+          fi
+
+          find "$OUT" -type f -printf '%p\t%s bytes\n' | sort > "$OUT/FILES.txt"
+          find "$OUT" -type f -print0 | sort -z | xargs -0 sha256sum > "$OUT/SHA256SUMS.txt"
+          cat "$OUT/FILES.txt"
+        env:
+          OUT: ${{ github.workspace }}/source_v2
+
+      - name: Upload expanded source evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-source-v2-woSiT-kytXo
+          path: source_v2/
+          if-no-files-found: warn
+          retention-days: 1
+          compression-level: 0

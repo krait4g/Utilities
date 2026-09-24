@@ -1,0 +1,157 @@
+name: tmp-video-source-acquire-v3
+
+on:
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  acquire-v3:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install media tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg jq curl
+      - name: Query alternative public YouTube frontends and download playable media/storyboards
+        shell: bash
+        run: |
+          set +e
+          OUT="$GITHUB_WORKSPACE/source_v3"
+          mkdir -p "$OUT/api" "$OUT/logs" "$OUT/storyboards" "$OUT/downloads"
+          VID='woSiT_kytXo'
+
+          PIPED=(
+            'https://pipedapi.kavin.rocks'
+            'https://pipedapi.leptons.xyz'
+            'https://pipedapi.nosebs.ru'
+            'https://pipedapi.syncpundit.io'
+            'https://api-piped.mha.fi'
+            'https://piped-api.garudalinux.org'
+          )
+          for base in "${PIPED[@]}"; do
+            key=$(echo "$base" | sed 's#https://##; s#[^A-Za-z0-9]#_#g')
+            curl -sS -L --connect-timeout 12 --max-time 90 -D "$OUT/api/piped_${key}.headers" \
+              "$base/streams/$VID" -o "$OUT/api/piped_${key}.json"
+          done
+
+          INVIDIOUS=(
+            'https://inv.nadeko.net'
+            'https://invidious.nerdvpn.de'
+            'https://yt.chocolatemoo53.com'
+            'https://invidious.tiekoetter.com'
+          )
+          for base in "${INVIDIOUS[@]}"; do
+            key=$(echo "$base" | sed 's#https://##; s#[^A-Za-z0-9]#_#g')
+            curl -sS -L --connect-timeout 12 --max-time 90 -D "$OUT/api/invidious_${key}.headers" \
+              "$base/api/v1/videos/$VID?local=true" -o "$OUT/api/invidious_${key}.json"
+            curl -sS -L --connect-timeout 12 --max-time 600 \
+              "$base/latest_version?id=$VID&itag=22&local=true" -o "$OUT/downloads/${key}_itag22.mp4" \
+              2>"$OUT/logs/${key}_itag22.log"
+            curl -sS -L --connect-timeout 12 --max-time 600 \
+              "$base/latest_version?id=$VID&itag=18&local=true" -o "$OUT/downloads/${key}_itag18.mp4" \
+              2>"$OUT/logs/${key}_itag18.log"
+          done
+
+          # Parse every successful Piped response, preserving all stream and preview URLs.
+          python - <<'PY'
+          import glob,json,os,subprocess,urllib.parse
+          out=os.environ['OUT']
+          rows=[]
+          for p in glob.glob(out+'/api/piped_*.json'):
+            try: j=json.load(open(p,encoding='utf-8'))
+            except Exception: continue
+            if not isinstance(j,dict): continue
+            rows.append({'file':p,'title':j.get('title'),'duration':j.get('duration'),'videoStreams':j.get('videoStreams'),'audioStreams':j.get('audioStreams'),'previewFrames':j.get('previewFrames')})
+            # choose up to 4 video and 4 audio candidates, highest quality/bitrate first
+            vs=[x for x in (j.get('videoStreams') or []) if isinstance(x,dict) and x.get('url')]
+            aus=[x for x in (j.get('audioStreams') or []) if isinstance(x,dict) and x.get('url')]
+            def vscore(x):
+                h=x.get('height') or 0; br=x.get('bitrate') or 0
+                return (h,br)
+            vs=sorted(vs,key=vscore,reverse=True)
+            aus=sorted(aus,key=lambda x:x.get('bitrate') or 0,reverse=True)
+            tag=os.path.basename(p).replace('.json','')
+            for i,x in enumerate(vs[:4]):
+                dest=f'{out}/downloads/{tag}_video_{i}.bin'
+                subprocess.run(['curl','-fL','--retry','2','--connect-timeout','12','--max-time','700',x['url'],'-o',dest])
+            for i,x in enumerate(aus[:4]):
+                dest=f'{out}/downloads/{tag}_audio_{i}.bin'
+                subprocess.run(['curl','-fL','--retry','2','--connect-timeout','12','--max-time','700',x['url'],'-o',dest])
+            # previewFrames may be actual timestamped frame URLs; preserve/download all that are explicit.
+            pf=j.get('previewFrames') or []
+            if isinstance(pf,list):
+                flat=[]
+                for x in pf:
+                    if isinstance(x,str): flat.append(x)
+                    elif isinstance(x,dict):
+                        for k in ('url','urls'):
+                            v=x.get(k)
+                            if isinstance(v,str): flat.append(v)
+                            elif isinstance(v,list): flat += [q for q in v if isinstance(q,str)]
+                for i,u in enumerate(dict.fromkeys(flat)):
+                    subprocess.run(['curl','-fL','--retry','2','--connect-timeout','12','--max-time','120',u,'-o',f'{out}/storyboards/piped_{i:05d}.jpg'])
+          json.dump(rows,open(out+'/piped_parsed.json','w',encoding='utf-8'),ensure_ascii=False,indent=2)
+          PY
+
+          # Parse Invidious JSON for storyboards/captions/media and download explicit storyboard image URLs when present.
+          python - <<'PY'
+          import glob,json,os,re,subprocess
+          out=os.environ['OUT']
+          report=[]
+          for p in glob.glob(out+'/api/invidious_*.json'):
+            try: j=json.load(open(p,encoding='utf-8'))
+            except Exception: continue
+            if not isinstance(j,dict): continue
+            report.append({'file':p,'title':j.get('title'),'lengthSeconds':j.get('lengthSeconds'),'storyboards':j.get('storyboards'),'formatStreams':j.get('formatStreams'),'adaptiveFormats':j.get('adaptiveFormats'),'captions':j.get('captions')})
+            # Direct URL candidates from API.
+            fm=[]
+            for x in (j.get('formatStreams') or [])+(j.get('adaptiveFormats') or []):
+                if isinstance(x,dict) and x.get('url'): fm.append(x)
+            fm=sorted(fm,key=lambda x:((x.get('height') or 0),(x.get('bitrate') or 0)),reverse=True)
+            tag=os.path.basename(p).replace('.json','')
+            for i,x in enumerate(fm[:8]):
+                subprocess.run(['curl','-fL','--retry','2','--connect-timeout','12','--max-time','700',x['url'],'-o',f'{out}/downloads/{tag}_fmt_{i}.bin'])
+            # Storyboard objects usually include a URL template; save templates and attempt obvious indexed forms.
+            sb=j.get('storyboards') or []
+            open(out+f'/api/{tag}_storyboards_pretty.json','w',encoding='utf-8').write(json.dumps(sb,ensure_ascii=False,indent=2))
+          json.dump(report,open(out+'/invidious_parsed.json','w',encoding='utf-8'),ensure_ascii=False,indent=2)
+          PY
+
+          # Find the best playable media artifact and generate normalized evidence.
+          CAND=''
+          BESTH=0
+          while IFS= read -r f; do
+            [ -s "$f" ] || continue
+            h=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 "$f" 2>/dev/null | head -1)
+            [ -n "$h" ] || continue
+            if [ "$h" -gt "$BESTH" ] 2>/dev/null; then CAND="$f"; BESTH="$h"; fi
+          done < <(find "$OUT/downloads" -type f | sort)
+          if [ -n "$CAND" ]; then
+            cp "$CAND" "$OUT/video_best.mp4"
+            ffprobe -v quiet -print_format json -show_format -show_streams "$OUT/video_best.mp4" > "$OUT/ffprobe_best.json"
+            ffmpeg -y -i "$OUT/video_best.mp4" -vn -ac 1 -ar 16000 -c:a libopus -b:a 24k "$OUT/audio_16k.opus" >"$OUT/logs/audio.out" 2>"$OUT/logs/audio.err"
+            mkdir -p "$OUT/frames_2s" "$OUT/scenes"
+            ffmpeg -y -i "$OUT/video_best.mp4" -vf 'fps=1/2,scale=1280:-2' -q:v 3 "$OUT/frames_2s/%06d.jpg" >"$OUT/logs/frames2.out" 2>"$OUT/logs/frames2.err"
+            ffmpeg -y -i "$OUT/video_best.mp4" -vf "select='gt(scene,0.08)',scale=1280:-2,showinfo" -vsync vfr -q:v 3 "$OUT/scenes/%06d.jpg" >"$OUT/logs/scenes.out" 2>"$OUT/logs/scenes.err"
+          fi
+
+          find "$OUT" -type f -printf '%p\t%s bytes\n' | sort > "$OUT/FILES.txt"
+          find "$OUT" -type f -print0 | sort -z | xargs -0 sha256sum > "$OUT/SHA256SUMS.txt"
+          cat "$OUT/FILES.txt"
+        env:
+          OUT: ${{ github.workspace }}/source_v3
+      - name: Upload Piped/Invidious evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-source-v3-woSiT-kytXo
+          path: source_v3/
+          if-no-files-found: warn
+          retention-days: 1
+          compression-level: 0
