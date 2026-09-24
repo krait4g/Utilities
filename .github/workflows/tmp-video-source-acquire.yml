@@ -1,0 +1,135 @@
+name: tmp-video-source-acquire
+
+on:
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  acquire:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg jq
+          python -m pip install --upgrade pip
+          python -m pip install yt-dlp youtube-transcript-api
+
+      - name: Acquire source evidence
+        shell: bash
+        run: |
+          set +e
+          mkdir -p source/subs source/logs
+          VIDEO_ID='woSiT_kytXo'
+          URL="https://www.youtube.com/watch?v=${VIDEO_ID}"
+          echo "Target: $URL" | tee source/logs/target.txt
+
+          for LANG in ko en; do
+            curl -fL --retry 3 --connect-timeout 15 --max-time 180 \
+              "https://youtube-transcript.ai/transcript/${VIDEO_ID}.txt?lang=${LANG}" \
+              -o "source/transcript_youtube_transcript_ai_${LANG}.txt" \
+              2>"source/logs/transcript_${LANG}.log"
+          done
+          curl -fL --retry 3 --connect-timeout 15 --max-time 180 \
+            "https://youtube-transcript.ai/transcript/${VIDEO_ID}.txt" \
+            -o source/transcript_youtube_transcript_ai_default.txt \
+            2>source/logs/transcript_default.log
+
+          python - <<'PY' >source/logs/youtube_transcript_api.log 2>&1
+          import json
+          from youtube_transcript_api import YouTubeTranscriptApi
+          vid='woSiT_kytXo'
+          api=YouTubeTranscriptApi()
+          report={}
+          try:
+              listing=api.list(vid)
+              report['available']=[{'language':t.language,'language_code':t.language_code,'is_generated':t.is_generated,'is_translatable':t.is_translatable} for t in listing]
+              for code in ['ko','en']:
+                  try:
+                      t=listing.find_transcript([code])
+                      f=t.fetch()
+                      seg=[{'text':x.text,'start':x.start,'duration':x.duration} for x in f]
+                      with open(f'source/transcript_yta_{code}.json','w',encoding='utf-8') as fp:
+                          json.dump(seg,fp,ensure_ascii=False,indent=2)
+                  except Exception as e:
+                      report[f'error_{code}']=repr(e)
+          except Exception as e:
+              report['fatal']=repr(e)
+          with open('source/transcript_yta_listing.json','w',encoding='utf-8') as fp:
+              json.dump(report,fp,ensure_ascii=False,indent=2)
+          print(json.dumps(report,ensure_ascii=False,indent=2))
+          PY
+
+          yt-dlp --no-playlist --dump-single-json --skip-download "$URL" \
+            > source/yt_dlp_metadata.json 2> source/logs/yt_dlp_metadata.log
+          yt-dlp --no-playlist --skip-download --write-subs --write-auto-subs \
+            --sub-langs 'ko,ko.*,en,en.*' --sub-format vtt \
+            -o 'source/subs/%(id)s.%(language)s.%(ext)s' "$URL" \
+            > source/logs/yt_dlp_subs.out 2> source/logs/yt_dlp_subs.err
+
+          curl -fLG --retry 3 --connect-timeout 15 --max-time 180 \
+            'https://api.microlink.io/' \
+            --data-urlencode "url=$URL" \
+            --data 'video=true' --data 'audio=true' --data 'meta=true' \
+            -o source/microlink.json 2>source/logs/microlink.log
+
+          VIDEO_MEDIA_URL=$(jq -r '.data.video.url // empty' source/microlink.json 2>/dev/null)
+          AUDIO_MEDIA_URL=$(jq -r '.data.audio.url // empty' source/microlink.json 2>/dev/null)
+          printf '%s' "$VIDEO_MEDIA_URL" > source/microlink_video_url.txt
+          printf '%s' "$AUDIO_MEDIA_URL" > source/microlink_audio_url.txt
+
+          if [ -n "$VIDEO_MEDIA_URL" ]; then
+            curl -fL --retry 4 --retry-all-errors --connect-timeout 20 --max-time 1500 \
+              "$VIDEO_MEDIA_URL" -o source/video_microlink.mp4 \
+              2>source/logs/download_video_microlink.log
+          fi
+          if [ -n "$AUDIO_MEDIA_URL" ]; then
+            curl -fL --retry 4 --retry-all-errors --connect-timeout 20 --max-time 1500 \
+              "$AUDIO_MEDIA_URL" -o source/audio_microlink.bin \
+              2>source/logs/download_audio_microlink.log
+          fi
+
+          yt-dlp --no-playlist --retries 5 --fragment-retries 5 \
+            -f 'bv*[height<=1080]+ba/b[height<=1080]' --merge-output-format mp4 \
+            -o 'source/video_ytdlp.%(ext)s' "$URL" \
+            > source/logs/yt_dlp_video.out 2> source/logs/yt_dlp_video.err
+
+          if [ -s source/video_microlink.mp4 ]; then
+            cp source/video_microlink.mp4 source/video.mp4
+          else
+            CAND=$(find source -maxdepth 1 -type f -name 'video_ytdlp.*' | head -1)
+            if [ -n "$CAND" ] && [ -s "$CAND" ]; then cp "$CAND" source/video.mp4; fi
+          fi
+
+          if [ -s source/video.mp4 ]; then
+            ffprobe -v quiet -print_format json -show_format -show_streams source/video.mp4 > source/ffprobe.json
+            ffmpeg -y -i source/video.mp4 -vn -ac 1 -ar 16000 -c:a libopus -b:a 24k source/audio_16k.opus \
+              >source/logs/ffmpeg_audio.out 2>source/logs/ffmpeg_audio.err
+            mkdir -p source/frames_5s source/scenes
+            ffmpeg -y -i source/video.mp4 -vf 'fps=1/5,scale=1280:-2' -q:v 3 source/frames_5s/%06d.jpg \
+              >source/logs/ffmpeg_frames5.out 2>source/logs/ffmpeg_frames5.err
+            ffmpeg -y -i source/video.mp4 -vf "select='gt(scene,0.15)',scale=1280:-2,showinfo" -vsync vfr -q:v 3 source/scenes/%06d.jpg \
+              >source/logs/ffmpeg_scenes.out 2>source/logs/ffmpeg_scenes.err
+          fi
+
+          find source -type f -print0 | sort -z | xargs -0 sha256sum > source/SHA256SUMS.txt
+          find source -type f -printf '%p\t%s bytes\n' | sort > source/FILES.txt
+          cat source/FILES.txt
+
+      - name: Upload source evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-source-woSiT-kytXo
+          path: source/
+          if-no-files-found: warn
+          retention-days: 1
+          compression-level: 0
